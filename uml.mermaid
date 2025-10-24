@@ -1,0 +1,80 @@
+sequenceDiagram
+    autonumber
+    actor User as Пользователь
+    participant FE as Frontend (React)
+    participant BE as Backend (Django/FastAPI)
+    participant RT as Centrifugo (WS)
+    participant DB as PostgreSQL
+
+    %% --- Аутентификация и выдача токенов ---
+    User ->> FE: Открывает приложение
+    FE ->> BE: GET /api/auth/me (проверка сессии/refresh)
+    alt Нет валидного access токена
+        FE ->> BE: POST /api/auth/login {email, password}
+        BE ->> DB: SELECT user, hash
+        DB -->> BE: user ok
+        BE -->> FE: {access_jwt, refresh_jwt, centrifugo_jwt}
+    else Токен валиден
+        BE -->> FE: {access_jwt, centrifugo_jwt}
+    end
+
+    %% --- Подключение к realtime и подписка на канал(ы) ---
+    note over FE: Инициализируем WS-клиент Centrifugo
+    FE ->> RT: WS CONNECT (JWT=centrifugo_jwt)
+    RT -->> FE: CONNECT OK
+    par Подписки
+        FE ->> RT: SUBSCRIBE chat:room:{room_id}
+        RT -->> FE: SUBSCRIBED (recoverable, positioned)
+    and Загрузка первичной истории
+        FE ->> BE: GET /api/rooms/{room_id}/messages?limit=50
+        BE ->> DB: SELECT last 50 messages
+        DB -->> BE: rows
+        BE -->> FE: messages[]
+    end
+
+    %% --- Отправка сообщения ---
+    User ->> FE: Отправить "Привет!"
+    note right of FE: Валидация, локальный оптимистичный рендер (опц.)
+    FE ->> BE: POST /api/messages {room_id, text} (Bearer access_jwt)
+    BE ->> DB: INSERT INTO messages (room_id, user_id, text, ts)
+    DB -->> BE: message_id
+    note right of BE: Паблиш в Centrifugo через HTTP/GRPC API
+    BE ->> RT: PUBLISH channel=chat:room:{room_id}, data={message}
+    RT -->> FE: PUBLICATION {message}
+    FE ->> User: Показывает доставленное сообщение
+
+    %% --- Индикаторы набора/присутствие (опционально) ---
+    opt typing indicator
+        FE ->> BE: POST /api/typing {room_id}
+        BE ->> RT: PUBLISH channel=chat:room:{room_id}, data={user_typing}
+        RT -->> FE: PUBLICATION {user_typing}
+    end
+    opt presence join/leave
+        FE ->> RT: SUBSCRIBE presence:room:{room_id}
+        RT -->> FE: PUBLICATION {user_joined/left}
+    end
+
+    %% --- Маркеры прочтения (read receipts) ---
+    User ->> FE: Открыл чат и пролистал до конца
+    FE ->> BE: POST /api/read-up-to {room_id, last_message_id}
+    BE ->> DB: UPDATE read_state
+    DB -->> BE: ok
+    BE ->> RT: PUBLISH channel=chat:room:{room_id}, data={read_state}
+    RT -->> FE: PUBLICATION {read_state}
+
+    %% --- Рековер/ресабскрайб при реконнекте ---
+    note over FE,RT: Потеря соединения (сетевой сбой)
+    RT -->> FE: disconnect
+    alt Токен истёк
+        FE ->> BE: POST /api/auth/refresh {refresh_jwt}
+        BE -->> FE: {access_jwt, centrifugo_jwt}
+    end
+    FE ->> RT: WS RECONNECT (JWT=centrifugo_jwt, recover=true, since=last_stream_pos)
+    RT -->> FE: PUBLICATIONS missed (history recovery)
+    RT -->> FE: CONNECT OK + RESUBSCRIBED
+
+    %% --- Выход из системы ---
+    User ->> FE: Logout
+    FE ->> BE: POST /api/auth/logout
+    BE -->> FE: 200
+    FE ->> RT: WS DISCONNECT
