@@ -1,0 +1,30 @@
+sequenceDiagram
+    autonumber
+    participant Beat as Celery Beat
+    participant Worker as Celery Worker
+    participant Task as Task "cash-back"
+    participant DB as PostgreSQL
+    participant Redis as Redis/Cache
+    participant Admin as Admin Panel
+
+    Beat->>Worker: расписание (crontab)
+    Worker->>Task: выполнить cash_back_collect_crontab
+    Task->>DB: BonusSystemSettings.get_solo()
+    alt cashback_on && cashback_percent
+        Task->>Task: process_cash_back(percent)
+        Task->>DB: SELECT ставки/профит/истории за период
+        Task->>Task: расчёт кэшбека по пользователям
+        Task->>Task: конвертации/каппинг
+        Task->>DB: SELECT FOR UPDATE owner wallet
+        Task->>Task: проверка достаточности OWNER пулла
+        alt хватает средств
+            Task->>DB: bulk_update UserWallets
+            Task->>DB: bulk_create CashBackHistory (is_accrued=True)
+            Task->>DB: списание OWNER бонусов
+        else не хватает
+            Task->>Task: raise OwnerLowBonusBalance → ROLLBACK
+        end
+        Task->>Redis: отправка событий (Rabbit)
+    else выключено / не настроено
+        Task->>Task: raise BonusSettingsMissing
+    end
